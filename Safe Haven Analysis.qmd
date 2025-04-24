@@ -1,0 +1,1634 @@
+---
+title: "The Role of Research Design Choices in Testing the Safe Haven Property of Gold (Supplementary Code) "
+format: html
+editor: visual
+---
+
+# Preparations
+
+## Initializing packages
+
+```{r}
+library(readxl)       # Load Excel data
+library(tidyverse)    # General QoL
+library(xts)          # Time series
+library(rugarch)      # GARCH
+library(rmgarch)      # DCC
+library(zoo)          # Cartesian product (for paths)
+library(future)       # Parallel computing
+library(future.apply) # Parallel computing
+library(sandwich)     #Newey-West errors
+library(lmtest)       #Coefficient testing using Newey- West errors
+library(timetk)       # Returns plot
+library(tseries)      #ADF, KPSS tests
+library(FinTS)        #ARCH-LM test
+```
+
+# Data preparation
+
+## Data loading
+
+Reading data, cleaning up column names, formatting as time series objects and merging gold data.
+
+```{r}
+#Loading gold spot data
+#Source: https://www.investing.com/currencies/xau-usd
+
+XAU_spot <- read_excel("XAU.xlsx")[,c("Date","Price")]
+colnames(XAU_spot) <- c("Date","XAU")
+XAU_spot <- xts(XAU_spot$XAU, order.by = as.Date(XAU_spot$Date, format="%m/%d/%Y"))
+
+#Loading gold futures data
+#Source: https://www.investing.com/commodities/gold-historical-data
+
+XAU_futures <- read_excel("XAU_futures.xlsx")
+XAU_futures <- xts(XAU_futures$Price,order.by = as.Date(XAU_futures$Date, format="%y-%m-%d"))
+
+#Merge gold data into one table
+XAU <- merge(XAU_spot,XAU_futures, join="inner")
+colnames(XAU) <- c("Spot","Futures")
+
+#Loading data for benchmark assets
+#Source: https://app2.msci.com/products/index-data-search/
+
+benchmarks <- read_excel("MSCI_Data.xlsx")
+benchmarks <- xts(benchmarks[,2:6], order.by = as.Date(benchmarks$Date, format="%y-%m-%d"))
+
+```
+
+## Calculate returns
+
+Standard logreturns.
+
+```{r}
+XAU_r <- diff(log(XAU))
+benchmarks_r <-diff(log(benchmarks))
+```
+
+Takes the logarithm of asset prices, then takes the difference of the logarithm.
+
+## Data tests
+
+Here we test the return data for stationarity and ARCH effects
+
+```{r}
+#Merge return data
+return_all <- merge(XAU_r,benchmarks_r, join="inner")
+return_all <- return_all[-1,]
+
+#Get number of rows
+returns_n <- ncol(return_all)
+
+#Initialize output matrix
+adf_kpss <- matrix(NA,3,returns_n)
+adf_kpss <- as.data.frame(adf_kpss)
+colnames(adf_kpss) <- colnames(return_all)
+rownames(adf_kpss) <- c("ADF","KPSS","ARCH-LM")
+
+for (i in 1:(returns_n)){
+  #Perform Augmented Dickey-Fuller Test
+  adf <- adf.test(na.omit(return_all[,i]))
+  #Perform KPSS test
+  kpss <- kpss.test(na.omit(return_all[,i]))
+  #Perform ARCH-LM Test
+  arch <- ArchTest(na.omit(return_all[,i]))
+  #Print p-values
+  print(adf$p.value)
+  print(kpss$p.value)
+  print(arch$p.value)
+  #Assign test statistics to output matrix
+  adf_kpss[1,i] <-round(adf$statistic,3)
+  adf_kpss[2,i] <- round(kpss$statistic,3)
+  adf_kpss[3,i] <- round(arch$statistic,3)
+}
+write.csv(adf_kpss,"adf_kpss_arch.csv")
+```
+
+## Create crisis dummies
+
+Define the arbitrary crisis dummies in this step.
+
+```{r}
+#Define minimum start and end dates of the whole sample
+start_date <- as.Date("2000-01-01")
+end_date <- as.Date("2024-12-31")
+
+#Create a date vector that spans the entire sample
+all_dates <- seq.Date(from = start_date, to = end_date, by = "day")
+
+#Define start and end dates for COVID-19 crisis
+covid_start <- as.Date("2019-12-31")
+covid_end   <- as.Date("2020-04-24")
+
+#Define start and end dates for the Subprime crisis
+subprime_start <- as.Date("2008-01-01")
+subprime_end   <- as.Date("2010-12-31")
+
+#Define start and end dates for Eurodebt crisis
+eurodebt_start <- as.Date("2010-01-01")
+eurodebt_end   <- as.Date("2011-12-31")
+
+#Create a dataframe for the dummies
+crisis_dummies <- data.frame(Date = all_dates)
+
+#Assign 1s and 0s based on the start and end dates
+crisis_dummies$COVID <- as.numeric(crisis_dummies$Date >= covid_start &
+                                              crisis_dummies$Date <= covid_end)
+crisis_dummies$Subprime <- as.numeric(crisis_dummies$Date >= subprime_start &
+                                              crisis_dummies$Date <= subprime_end)
+crisis_dummies$Eurodebt <- as.numeric(crisis_dummies$Date >= eurodebt_start &
+                                              crisis_dummies$Date <= eurodebt_end)
+
+
+#Convert to time series object
+crisis_dummies <- xts(crisis_dummies[,2:4], order.by = as.Date(crisis_dummies$Date, format="%y-%m-%d"))
+```
+
+# Path assessment
+
+## General design nodes
+
+Here the design nodes and the corresponding choices related to both the Baur and DCC method families are defined
+
+```{r}
+
+#Sample start
+sample_start <- c(as.Date("2000-01-05"), as.Date("2008-01-01"), as.Date("2014-01-01"))
+
+#Sample end
+sample_end <- c(as.Date("2020-10-30"),as.Date("2024-12-31"))
+
+#Spot/Futures for gold
+spot_fut <- c("Spot", "Futures")
+
+#Benchmark assets
+benchmark_names <- colnames(benchmarks)
+
+#GARCH types
+garch_models=c("sGARCH", "eGARCH", "gjrGARCH", "fiGARCH")
+
+#GARCH error model
+garch_error=c("norm", "std")
+
+#Dummy type
+dummy_type <- c("Crisis", "Quantile")
+```
+
+## Baur paths
+
+### Define unique decision nodes and choices
+
+```{r}
+#Baur method as of now does not have unique parameters beyond the general ones
+```
+
+### Find all paths
+
+```{r}
+#Calculate all possible paths as a Cartesian product:
+baur_paths <- expand.grid(benchmark_names, sample_start, sample_end, spot_fut,garch_models,garch_error,dummy_type,stringsAsFactors=FALSE)
+
+#Name the path decision points:
+colnames(baur_paths) <- c("Benchmark","Sample_Start", "Sample_End", "Spot_Futures", "GARCH_Model", "GARCH_Error", "Dummy_Type")
+
+#Number of paths:
+baur_path_count <- nrow(baur_paths)
+```
+
+## DCC paths
+
+### Define unique decision nodes and choices
+
+```{r}
+#DCC types:
+dcc_types=c("DCC", "aDCC")
+```
+
+### Find all paths
+
+```{r}
+#Calculate all possible paths as a Cartesian Product:
+dcc_paths <- expand.grid(benchmark_names, sample_start, sample_end, spot_fut,garch_models,garch_error,dummy_type, dcc_types,stringsAsFactors=FALSE)
+
+#Name the path decision points:
+colnames(dcc_paths) <- c("Benchmark","Sample_Start", "Sample_End", "Spot_Futures", "GARCH_Model", "GARCH_Error", "Dummy_Type", "DCC_type")
+
+#Number of paths:
+dcc_path_count <- nrow(dcc_paths)
+
+#Match the DCC error distributions to the GARCH error distributions
+dcc_paths$DCC_Error <- NA
+for (i in 1:dcc_path_count){
+  if (dcc_paths[i,"GARCH_Error"]=="norm"){
+    dcc_paths[i,"DCC_Error"] <- "mvnorm"
+  } else {
+    dcc_paths[i,"DCC_Error"] <- "mvt"
+  }
+}
+```
+
+# Parallel computing
+
+As the calculations for all the paths involve a lot of computing, it is advised to switch to parallel computing to increase the speed of the code execution by utilizing more cores of the CPU
+
+```{r}
+# Detect the number of available cores
+n_cores <- max(availableCores() - 1,1) # Leaving one core free is often recommended
+
+# Set the parallel plan using future
+plan(multisession, workers = n_cores)
+```
+
+# Workflow functions
+
+## Baur
+
+The following function runs the Baur regression
+
+```{r}
+run_baur_analysis <- function(i, paths_df, xau_returns, benchmark_returns) {
+  
+  # Get parameters for this iteration
+  current_path <- paths_df[i, ]
+  benchmark_col <- current_path$Benchmark
+  sam_start <- current_path$Sample_Start
+  sam_end <- current_path$Sample_End
+  gold_type <- current_path$Spot_Futures
+  garch_model <- current_path$GARCH_Model
+  garch_error <- current_path$GARCH_Error
+  d_type <- current_path$Dummy_Type
+
+  
+  # Prepare input data for this specific benchmark
+  used_benchmark <- benchmark_returns[, benchmark_col]
+  used_benchmark <- used_benchmark[index(used_benchmark)>=sam_start & index(used_benchmark)<=sam_end]
+  
+  #Prepare input data for gold
+  used_gold <- xau_returns[,gold_type]
+  used_gold <- used_gold[index(used_gold)>=sam_start & index(used_gold)<=sam_end]
+  
+  # Merge data to align dates, interpolate non-tail NAs, remove tail NAs
+  merged <- na.omit(na.approx(merge(used_gold,used_benchmark)))
+  
+  #Extract return series from merged data
+  safehaven_r <- merged[,1]
+  benchmark_r <- merged[,2]
+  
+  #Forking paths according to the dummy type
+  #Start with quantiles
+  if (d_type=="Quantile"){
+    
+    #Define quatile levels
+    benchmark_qs <- quantile(benchmark_r,c(0.10,0.05,0.025, 0.01))
+    
+    #Create an empty time series matrix for the dummies
+    benchmark_dummies <- xts(matrix(NA, nrow = nrow(benchmark_r), ncol = 4),
+                           order.by = index(benchmark_r))
+    
+    #Name the dummy columns
+    colnames(benchmark_dummies) <- c("p10","p5","p2.5", "p1")
+    
+    #Fill the matrix with the dummy values  
+    for (i in 1:4){
+      benchmark_dummies[,i]=(benchmark_r<=benchmark_qs[i])*1
+    }
+    
+    #Define empty time series matrix for interaction variables
+    interact_vars <- xts(matrix(NA, nrow = nrow(benchmark_r), ncol = 4),
+                       order.by = index(benchmark_r))
+    
+    #Calculate interaction variable values
+    for (i in 1:ncol(benchmark_dummies)) {
+      interact_vars[, i] <- benchmark_r * benchmark_dummies[, i]
+    }
+    
+    #Next, we work with the arbitrary crisis dummy cases
+  } else if (d_type=="Crisis"){
+    
+    #Filter out Subprime and Eurodebt crises if sample start is 2014-01-01
+    #Merge crisis dummies with return data
+      if (sam_start==as.Date("2014-01-01")){
+        benchmark_dummies <- merge(merged,crisis_dummies[,1], join="inner")
+      } else {
+      benchmark_dummies <- merge(merged,crisis_dummies,join="inner")
+      }
+    #Get aligned benchmark dummies from the merged table
+      benchmark_dummies <- benchmark_dummies[,3:ncol(benchmark_dummies)]
+    #Create empty matrix for interaction variables
+      interact_vars <- xts(matrix(NA, nrow = nrow(benchmark_r), ncol = ncol(benchmark_dummies)),
+                       order.by = index(benchmark_r))
+      #Calculate interaction variables
+      for (i in 1:ncol(benchmark_dummies)) {
+        interact_vars[, i] <- benchmark_r * benchmark_dummies[, i]
+      }
+  } 
+    
+    #Assemble the the matrix of external regressors (eq. 12a, b, 14a, b)
+    external_regressors <- cbind(benchmark_r, interact_vars)
+  
+  
+  #Specification and Fitting
+  # Using tryCatch to handle potential errors during fitting without stopping everything
+  fit_result <- tryCatch({
+    
+    #GARCH specification:
+    garchspec <- ugarchspec(
+                            variance.model = list(model = garch_model, garchOrder = c(1, 1)), 
+                            mean.model = list(armaOrder = c(0, 0), include.mean = TRUE, external.regressors = external_regressors),
+                            distribution.model = garch_error 
+                           )
+    #GARCH fitting
+    fit <- ugarchfit(spec = garchspec, data = safehaven_r, solver="hybrid")
+    
+  }, error = function(e) {
+    # Return the error object if fitting fails
+    return(e)
+  })
+  
+  # Check if fitting resulted in an error
+  if (inherits(fit_result, "error")) {
+    warning(paste("Error fitting model for iteration", i, ":", conditionMessage(fit_result)))
+    return(list(path = current_path, summary = NULL, error = conditionMessage(fit_result)))
+  }
+  
+  # Explicitly check for convergence status within the fitted object
+  convergence_status <- tryCatch({
+      fit_result@fit$convergence # Access convergence status (0 = success)
+    }, error = function(e) {
+      NA # Handle cases where accessing the slot fails for some reason
+  })
+
+  converged_flag = (convergence_status == 0)
+
+  # Check if convergence status is NA or FALSE (failed)
+  if (is.na(converged_flag) || !converged_flag) {
+     warning(paste("Convergence issue detected for iteration", i, "(Convergence Code:", convergence_status, ")"))
+     #  Return fit anyway, but flag it
+     return(list(path = current_path, summary = fit_result, error = "Convergence Failure", converged = FALSE))
+  }
+  
+  # Return a list containing the path parameters and the regression summary
+  return(list(path = current_path, summary = fit_result, error = NULL, converged=TRUE))
+}
+```
+
+## DCC
+
+The following function specifies and fits the DCC model, then runs the appropriate OLS regression (eq.15)
+
+```{r}
+run_dcc_analysis <- function(i, paths_df, xau_returns, benchmark_returns) {
+  
+  # Get parameters for this iteration
+  current_path <- paths_df[i, ]
+  benchmark_col <- current_path$Benchmark
+  sam_start <- current_path$Sample_Start
+  sam_end <- current_path$Sample_End
+  gold_type <- current_path$Spot_Futures
+  garch_model <- current_path$GARCH_Model
+  garch_error <- current_path$GARCH_Error
+  d_type <- current_path$Dummy_Type
+  dcc_type <- current_path$DCC_type
+  dcc_error <- current_path$DCC_Error
+  
+  # Prepare input data for this specific benchmark
+  used_benchmark <- benchmark_returns[, benchmark_col]
+  used_benchmark <- used_benchmark[index(used_benchmark)>=sam_start & index(used_benchmark)<=sam_end]
+  
+  #Prepare input data for gold
+  used_gold <- xau_returns[,gold_type]
+  used_gold <- used_gold[index(used_gold)>=sam_start & index(used_gold)<=sam_end]
+  
+  # Merge data to align dates, interpolate non-tail NAs, remove tail NAs
+  dcc_input <- na.omit(na.approx(merge(used_gold,used_benchmark)))
+  
+  # Specification and Fitting 
+  # Use tryCatch to handle potential errors during fitting without stopping everything
+  fit_result <- tryCatch({
+    
+    #GARCH specification:
+    garchspec <- ugarchspec(mean.model = list(armaOrder = c(0,0)),
+                            variance.model = list(model = garch_model, garchOrder = c(1,1)),
+                            distribution.model = garch_error)
+    
+    #DCC specification:
+    dccspec <- dccspec(uspec = multispec(replicate(2, garchspec)),
+                       dccOrder = c(1,1), model = dcc_type,
+                       distribution = dcc_error)
+    
+    #DCC fitting:
+    dccfit(spec = dccspec, data = dcc_input, solver = c("hybrid", "solnp")) # Consider adding solver='solnp' or check convergence
+    
+  }, error = function(e) {
+    # Return the error object if fitting fails
+    return(e)
+  })
+  
+  # Check if fitting resulted in an error
+  if (inherits(fit_result, "error")) {
+    warning(paste("Error fitting model for iteration", i, ":", conditionMessage(fit_result)))
+    return(list(path = current_path,dcc_fit=fit_result,sh_lm=NULL, summary = NULL, error = conditionMessage(fit_result)))
+  }
+  
+    # Check Positivity Constraints
+  positivity_ok <- NA # Default to NA if check fails
+  try({ # Wrap in 'try' in case slots/names are unexpected or model failed subtly
+    coef_mat <- fit_result@mfit[["matcoef"]]
+
+          # Take the first alpha and beta found (usually dcca1, dccb1)
+          dcc_alpha <- coef_mat["[Joint]dcca1",1]
+          dcc_beta <- coef_mat["[Joint]dccb1",1]
+          
+          # Perform checks (allowing for small numerical tolerance)
+          tol <- sqrt(.Machine$double.eps) # Tolerance for >= 0 checks
+          check1 <- dcc_alpha >= -tol
+          check2 <- dcc_beta >= -tol
+          check3 <- (dcc_alpha + dcc_beta) < 1
+
+          # Combine checks - ensure none are NA before logical operation
+          if(!is.na(check1) && !is.na(check2) && !is.na(check3)) {
+               positivity_ok <- check1 && check2 && check3
+          } else {
+               warning(paste("NA result during positivity check for iteration", i))
+               positivity_ok <- FALSE # Treat NA checks as failure
+          }
+  }, silent = TRUE) # End try for positivity check
+
+  # If positivity_ok is FALSE here, it means constraints were violated or check failed
+  if (is.na(positivity_ok) || positivity_ok == FALSE) {
+      warning(paste("DCC Positivity Constraints Check Failed for iteration", i))
+      # Decide whether to stop or just flag. Let's flag and continue for now.
+  }
+  
+  #Post-processing if fit was successful
+  dccgarch <- fit_result # Assign the fitted object
+  dcc <- xts(rcor(dccgarch)[1,2,], order.by = index(dcc_input))
+  colnames(dcc) <- "DCC" # Give DCC column a name
+  
+  if (d_type=="Quantile"){
+  #Set percentiles for quantile analysis:
+  benchmark_qs <- quantile(dcc_input[, benchmark_col], probs = c(0.1,0.05, 0.025, 0.01), na.rm = TRUE)
+  
+  #Initialize an empty matrix for dummies and name the columns
+  benchmark_dummies <- xts(matrix(NA, nrow = nrow(dcc_input), ncol = 4),
+                           order.by = index(dcc_input))
+  colnames(benchmark_dummies) <- c("p10","p5","p2.5", "p1") # Match order to probs
+  
+  # Compute dummies for different quantile levels 
+  for (j in 1:4) {
+    benchmark_dummies[, j] <- as.numeric(dcc_input[, benchmark_col] <= benchmark_qs[j])
+  }
+  } else {
+    if (sam_start==sample_start[3]){
+      benchmark_dummies <-crisis_dummies[,1]
+    }
+    else {
+      benchmark_dummies <-crisis_dummies
+    }
+  }
+  
+  # Combine DCC and dummies for regression
+  regression_data <- merge(dcc, benchmark_dummies, join = "inner")
+  
+  # Check if data is available for regression
+  if (nrow(regression_data) > 0) {
+    shtest_dcc <- lm(DCC ~ ., data = regression_data)
+    reg_summary <- summary(shtest_dcc)
+  } else {
+    warning(paste("No data available for regression in iteration", i))
+    reg_summary <- NULL # Or some indicator of failure
+  }
+  
+  
+  # Return a list containing the path parameters and the regression summary
+  return(list(path = current_path,dcc_fit=fit_result, sh_lm=shtest_dcc, summary = reg_summary, error = NULL, positivity_check=positivity_ok))
+}
+```
+
+# Running the workflows
+
+Here we are running the previous functions for all paths using multithreaded computing.
+
+## Baur
+
+Computation takes \~6-7 minutes on a Ryzen 7 5800X3D CPU with 32GB RAM.
+
+```{r}
+#Get start time of calculation
+start_time <- Sys.time()
+  
+# future_lapply iterates over 1:path_count, calling run_baur_analysis for each 'i'
+baur_results <- future_lapply(1:baur_path_count, FUN = run_baur_analysis,
+                               paths_df = baur_paths,
+                               xau_returns = XAU_r,
+                               benchmark_returns = benchmarks_r,
+                               future.seed = TRUE) # Ensures reproducibility if randomness involved
+  
+#Get end time of calculation
+end_time <- Sys.time()
+
+#Print computation time
+print(paste("Parallel computation finished in:", round(end_time - start_time, 2), "minutes"))
+```
+
+## DCC
+
+**NOTE: The following process will produce a lot of warnings which indicates that the dcc fitting process sometimes doesn't find the right solution during the first few attempts. In the code chunk after the next one we'll demonstrate that in spite of the warnings eventually it all always find a stable solution.**
+
+Computation takes \~20 minutes on a Ryzen 7 5800X3D CPU with 32GB RAM.
+
+```{r}
+#Get start time of calculation
+start_time <- Sys.time()
+
+# future_lapply iterates over 1:path_count, calling run_dcc_analysis for each 'i'
+dcc_results <- future_lapply(1:dcc_path_count, FUN = run_dcc_analysis,
+                             paths_df = dcc_paths,
+                             xau_returns = XAU_r,
+                             benchmark_returns = benchmarks_r,
+                             future.seed = TRUE) # Ensures reproducibility if randomness involved
+
+#Get end time of calculation
+end_time <- Sys.time()
+
+#Print computation time
+print(paste("Parallel computation finished in:", round(end_time - start_time, 2), "minutes"))
+```
+
+Check whether the stationarity constraints were fulfilled in the end or not for all paths. dcc_errors will contain the indices of failed paths (should be an empty list in the end as constraints are always fulfilled).
+
+```{r}
+dcc_errors <- list()
+for (i in 1:length(dcc_results)){
+  if (dcc_results[[i]]$positivity_check==FALSE){
+  dcc_errors <- append(dcc_errors,i)
+  }
+}
+```
+
+# Evaluation
+
+This section will perform the safe haven tests for all estimated paths.
+
+## Baur
+
+### Test functions
+
+#### General safe haven test function
+
+Here we are defining the function that performs the general\* safe haven test for Baur's method.
+
+\*At least a weak safe haven.
+
+```{r}
+perform_safe_haven_test <- function(fit_result, dummy_type, test_specifier) {
+
+  # 1. Extract Coefficients and VCOV Matrix
+  coeffs <- tryCatch(coef(fit_result), error = function(e) NULL)
+   # Try using the robust variance-covariance matrix first
+  vcov_matrix <- tryCatch({
+      vcov(fit_result, robust = TRUE) # Set robust = TRUE
+    }, error = function(e) {
+      warning(paste("Robust vcov calculation failed:", conditionMessage(e)))
+      # return NULL if robust fails
+      NULL
+  })
+  
+  # Centralized NA return structure
+  na_return_list <- list(
+      test_sum = NA_real_, std_err = NA_real_, t_stat = NA_real_,
+      p_value = NA_real_, coefficients_summed = NA_character_,
+      error_message = NULL
+  )
+
+  if (is.null(coeffs) || is.null(vcov_matrix)) {
+    warning("Could not extract coefficients or vcov matrix.")
+    na_return_list$error_message <- "Could not extract coefficients or vcov matrix."
+    return(na_return_list)
+  }
+  
+
+  # 2. Identify the correct coefficients based on dummy_type and test_specifier
+  coeff_names <- names(coeffs)
+  beta1_name <- "mxreg1" # Assumes benchmark_r is always the first external regressor
+
+  target_coeffs_names <- NULL # Initialize
+
+  # Check if beta1_name exists
+  if (!beta1_name %in% coeff_names) {
+      warning("Coefficient for benchmark return (mxreg1) not found.")
+      na_return_list$error_message <- "Coefficient for benchmark return (mxreg1) not found."
+      return(na_return_list)
+  }
+
+
+  #Logic Branching based on dummy_type
+  if (dummy_type == "Quantile") {
+    quantile_level <- test_specifier # e.g., 5, 1, 10, 2.5
+
+    # Define mapping based on regressor order:
+    # benchmark_r, interact_p10, interact_p5, interact_p2.5, interact_p1
+    gamma_map <- c("10" = "mxreg2", "5" = "mxreg3", "2.5" = "mxreg4", "1" = "mxreg5")
+    gamma10_name <- gamma_map["10"]
+    gamma5_name  <- gamma_map["5"]
+    gamma2.5_name<- gamma_map["2.5"]
+    gamma1_name  <- gamma_map["1"]
+
+    # Determine which coefficients to sum based on quantile_level
+    # Using Baur & McDermott interpretation (sum includes benchmark coeff + relevant interactions)
+    if (quantile_level == 5) {
+      target_coeffs_names <- c(beta1_name, gamma10_name, gamma5_name)
+    } else if (quantile_level == 1) {
+      target_coeffs_names <- c(beta1_name, gamma10_name, gamma5_name, gamma2.5_name, gamma1_name)
+    } else if (quantile_level == 10) {
+      target_coeffs_names <- c(beta1_name, gamma10_name)
+    } else if (quantile_level == 2.5) {
+      target_coeffs_names <- c(beta1_name, gamma10_name, gamma5_name, gamma2.5_name)
+    } else {
+      warning(paste("Quantile level", quantile_level, "test not defined."))
+      na_return_list$error_message <- paste("Quantile level", quantile_level, "test not defined.")
+      return(na_return_list)
+    }
+
+  } else if (dummy_type == "Crisis") {
+    crisis_name <- test_specifier # e.g., "COVID", "Subprime", "Eurodebt"
+
+    # Define mapping based on regressor order:
+    # benchmark_r, interact_COVID, interact_Subprime, interact_Eurodebt
+    # IMPORTANT: Verify this order matches the output of run_baur_analysis
+    crisis_gamma_map <- c("COVID" = "mxreg2", "Subprime" = "mxreg3", "Eurodebt" = "mxreg4")
+
+    if (!crisis_name %in% names(crisis_gamma_map)) {
+       warning(paste("Crisis name", crisis_name, "test not defined or mapping incorrect."))
+       na_return_list$error_message <- paste("Crisis name", crisis_name, "test not defined or mapping incorrect.")
+       return(na_return_list)
+    }
+    specific_gamma_name <- crisis_gamma_map[crisis_name]
+
+    # Test for crisis period is Beta1 + Gamma_Crisis
+    target_coeffs_names <- c(beta1_name, specific_gamma_name)
+
+  } else {
+     warning(paste("Unknown dummy_type:", dummy_type))
+     na_return_list$error_message <- paste("Unknown dummy_type:", dummy_type)
+     return(na_return_list)
+  }
+
+  # Check if all target coefficient names exist in the fitted model
+  missing_coeffs <- setdiff(target_coeffs_names, coeff_names)
+  if (length(missing_coeffs) > 0) {
+      warning(paste("Could not find required coefficient(s):", paste(missing_coeffs, collapse=", ")))
+      print(paste("Available coeffs:", paste(coeff_names, collapse=", ")))
+      na_return_list$error_message <- paste("Missing coefficient(s):", paste(missing_coeffs, collapse=", "))
+      return(na_return_list)
+  }
+
+  # Find the numeric indices of these coefficients
+  target_coeffs_indices <- match(target_coeffs_names, coeff_names)
+
+  # 3. Define the Linear Combination Vector (L)
+  L <- numeric(length(coeffs))
+  L[target_coeffs_indices] <- 1
+
+  # 4. Calculate the Sum (S = L' * theta)
+  test_sum <- L %*% coeffs
+
+  # 5. Calculate the Variance and Standard Error of the Sum (Var(S) = L' * V * L)
+  var_sum <- tryCatch(t(L) %*% vcov_matrix %*% L, error = function(e) NA)
+
+  if(is.na(var_sum) || var_sum < 0) {
+      warning("Could not calculate variance of the sum or it was negative.")
+      std_err <- NA_real_
+      t_stat <- NA_real_
+      p_value <- NA_real_
+      na_return_list$error_message <- "Could not calculate variance of the sum or it was negative."
+      # Still return the calculated sum if possible
+      na_return_list$test_sum <- as.numeric(test_sum)
+      na_return_list$coefficients_summed <- paste(target_coeffs_names, collapse=" + ")
+      return(na_return_list)
+
+  } else {
+      std_err <- sqrt(var_sum)
+
+      # 6. Calculate the t-statistic (or z-statistic) for H0: Sum > 0 vs HA: Sum <= 0
+      t_stat <- test_sum / std_err
+
+      # 7. Calculate the one-sided p-value P(T <= t_stat)
+      # Using pnorm for asymptotic normality (standard for GARCH)
+      p_value <- pnorm(t_stat,lower.tail=FALSE) #Leverage asymptotic normal property
+      error_message <- NULL # No error in calculation part
+  }
+
+  # Return results
+  return(list(
+      test_sum = as.numeric(test_sum),
+      std_err = as.numeric(std_err),
+      t_stat = as.numeric(t_stat),
+      p_value = as.numeric(p_value),
+      coefficients_summed = paste(target_coeffs_names, collapse=" + "), # Store names of summed coeffs
+      error_message = error_message
+      ))}
+```
+
+#### Strong safe haven test function
+
+Similar logic to previous function, with a different p-value calculation method at the end.
+
+```{r}
+perform_strong_safe_haven_test <- function(fit_result, dummy_type, test_specifier) {
+  # 1. Extract Coefficients and VCOV Matrix
+  coeffs <- tryCatch(coef(fit_result), error = function(e) NULL)
+   # Try using the robust variance-covariance matrix first
+  vcov_matrix <- tryCatch({
+      vcov(fit_result, robust = TRUE) # Set robust = TRUE
+    }, error = function(e) {
+      warning(paste("Robust vcov calculation failed:", conditionMessage(e)))
+      # Optional: Fallback to trying the default one if robust fails?
+      # tryCatch(vcov(fit_result, robust = FALSE), error = function(e2) NULL)
+      # Or just return NULL if robust fails
+      NULL
+  })
+  # Centralized NA return structure
+  na_return_list <- list(
+      test_sum = NA_real_, std_err = NA_real_, t_stat = NA_real_,
+      p_value = NA_real_, coefficients_summed = NA_character_,
+      error_message = NULL
+  )
+
+  if (is.null(coeffs) || is.null(vcov_matrix)) {
+    warning("Could not extract coefficients or vcov matrix.")
+    na_return_list$error_message <- "Could not extract coefficients or vcov matrix."
+    return(na_return_list)
+  }
+
+  # 2. Identify the correct coefficients based on dummy_type and test_specifier
+  coeff_names <- names(coeffs)
+  beta1_name <- "mxreg1" # Assumes benchmark_r is always the first external regressor
+
+  target_coeffs_names <- NULL # Initialize
+
+  # Check if beta1_name exists
+  if (!beta1_name %in% coeff_names) {
+      warning("Coefficient for benchmark return (mxreg1) not found.")
+      na_return_list$error_message <- "Coefficient for benchmark return (mxreg1) not found."
+      return(na_return_list)
+  }
+
+
+  # --- Logic Branching based on dummy_type ---
+  if (dummy_type == "Quantile") {
+    quantile_level <- test_specifier # e.g., 5, 1, 10, 2.5
+
+    # Define mapping based on regressor order:
+    # benchmark_r, interact_p10, interact_p5, interact_p2.5, interact_p1
+    gamma_map <- c("10" = "mxreg2", "5" = "mxreg3", "2.5" = "mxreg4", "1" = "mxreg5")
+    gamma10_name <- gamma_map["10"]
+    gamma5_name  <- gamma_map["5"]
+    gamma2.5_name<- gamma_map["2.5"]
+    gamma1_name  <- gamma_map["1"]
+
+    # Determine which coefficients to sum based on quantile_level
+    # Using Baur & McDermott interpretation (sum includes benchmark coeff + relevant interactions)
+    if (quantile_level == 5) {
+      target_coeffs_names <- c(beta1_name, gamma10_name, gamma5_name)
+    } else if (quantile_level == 1) {
+      target_coeffs_names <- c(beta1_name, gamma10_name, gamma5_name, gamma2.5_name, gamma1_name)
+    } else if (quantile_level == 10) {
+      target_coeffs_names <- c(beta1_name, gamma10_name)
+    } else if (quantile_level == 2.5) {
+      target_coeffs_names <- c(beta1_name, gamma10_name, gamma5_name, gamma2.5_name)
+    } else {
+      warning(paste("Quantile level", quantile_level, "test not defined."))
+      na_return_list$error_message <- paste("Quantile level", quantile_level, "test not defined.")
+      return(na_return_list)
+    }
+
+  } else if (dummy_type == "Crisis") {
+    crisis_name <- test_specifier # e.g., "COVID", "Subprime", "Eurodebt"
+
+    # Define mapping based on regressor order:
+    # benchmark_r, interact_COVID, interact_Subprime, interact_Eurodebt
+    crisis_gamma_map <- c("COVID" = "mxreg2", "Subprime" = "mxreg3", "Eurodebt" = "mxreg4")
+
+    if (!crisis_name %in% names(crisis_gamma_map)) {
+       warning(paste("Crisis name", crisis_name, "test not defined or mapping incorrect."))
+       na_return_list$error_message <- paste("Crisis name", crisis_name, "test not defined or mapping incorrect.")
+       return(na_return_list)
+    }
+    specific_gamma_name <- crisis_gamma_map[crisis_name]
+
+    # Test for crisis period is Beta1 + Gamma_Crisis
+    target_coeffs_names <- c(beta1_name, specific_gamma_name)
+
+  } else {
+     warning(paste("Unknown dummy_type:", dummy_type))
+     na_return_list$error_message <- paste("Unknown dummy_type:", dummy_type)
+     return(na_return_list)
+  }
+
+  # Check if all target coefficient names exist in the fitted model
+  missing_coeffs <- setdiff(target_coeffs_names, coeff_names)
+  if (length(missing_coeffs) > 0) {
+      warning(paste("Could not find required coefficient(s):", paste(missing_coeffs, collapse=", ")))
+      print(paste("Available coeffs:", paste(coeff_names, collapse=", ")))
+      na_return_list$error_message <- paste("Missing coefficient(s):", paste(missing_coeffs, collapse=", "))
+      return(na_return_list)
+  }
+
+  # Find the numeric indices of these coefficients
+  target_coeffs_indices <- match(target_coeffs_names, coeff_names)
+
+  # 3. Define the Linear Combination Vector (L)
+  L <- numeric(length(coeffs))
+  L[target_coeffs_indices] <- 1
+
+  # 4. Calculate the Sum (S = L' * theta)
+  test_sum <- L %*% coeffs
+
+  # 5. Calculate the Variance and Standard Error of the Sum (Var(S) = L' * V * L)
+  var_sum <- tryCatch(t(L) %*% vcov_matrix %*% L, error = function(e) NA)
+
+  if(is.na(var_sum) || var_sum < 0) {
+      warning("Could not calculate variance of the sum or it was negative.")
+      std_err <- NA_real_
+      t_stat <- NA_real_
+      p_value <- NA_real_
+      na_return_list$error_message <- "Could not calculate variance of the sum or it was negative."
+      # Still return the calculated sum if possible
+      na_return_list$test_sum <- as.numeric(test_sum)
+      na_return_list$coefficients_summed <- paste(target_coeffs_names, collapse=" + ")
+      return(na_return_list)
+
+  } else {
+      std_err <- sqrt(var_sum)
+
+      # 6. Calculate the t-statistic (or z-statistic) for H0: Sum > 0 vs HA: Sum <= 0
+      t_stat <- test_sum / std_err
+
+      # 7. Calculate the one-sided p-value P(T <= t_stat)
+      # Using pnorm for asymptotic normality (standard for GARCH)
+      p_value <- pnorm(t_stat,lower.tail=TRUE) #For strong property, leverage asymptotic normality
+      error_message <- NULL # No error in calculation part
+  }
+
+  # Return results
+  return(list(
+      test_sum = as.numeric(test_sum),
+      std_err = as.numeric(std_err),
+      t_stat = as.numeric(t_stat),
+      p_value = as.numeric(p_value),
+      coefficients_summed = paste(target_coeffs_names, collapse=" + "), # Store names of summed coeffs
+      error_message = error_message
+      ))
+}
+```
+
+### Test running
+
+In this section we will perform the safe haven tests for Baur's method.
+
+#### General safe haven tests
+
+```{r}
+sh_test_results <- list()
+for (k in 1:length(baur_results)) {
+    result_item <- baur_results[[k]]
+    current_path_info <- baur_paths[k, ] # Get path info for this result
+
+    tests_for_this_path <- list() # Store potentially multiple tests per path
+
+    # Check if fit exists and converged
+    if (!is.null(result_item$summary) &&
+        !inherits(result_item$summary, "error") &&
+        !is.null(result_item$converged) && result_item$converged == TRUE) {
+
+        fit_object <- result_item$summary
+        current_dummy_type <- current_path_info$Dummy_Type
+
+        if (current_dummy_type == "Quantile") {
+            # Perform tests for all defined quantile levels
+            tests_for_this_path$Quantile_10 <- perform_safe_haven_test(fit_object, "Quantile", 10)
+            tests_for_this_path$Quantile_5  <- perform_safe_haven_test(fit_object, "Quantile", 5)
+            tests_for_this_path$Quantile_2.5<- perform_safe_haven_test(fit_object, "Quantile", 2.5)
+            tests_for_this_path$Quantile_1  <- perform_safe_haven_test(fit_object, "Quantile", 1)
+        } else if (current_dummy_type == "Crisis") {
+# Check which crisis dummies were included based on Sample_Start
+            if (current_path_info$Sample_Start == as.Date("2014-01-01")) {
+                # Only COVID dummy was included for this path start date
+                tests_for_this_path$Crisis_COVID <- perform_safe_haven_test(fit_object, "Crisis", "COVID")
+                # Add entries indicating other tests were not applicable
+                tests_for_this_path$Crisis_Subprime <- list(error_message = "Test not applicable for this path specification (Start Date 2014)")
+                tests_for_this_path$Crisis_Eurodebt <- list(error_message = "Test not applicable for this path specification (Start Date 2014)")
+            } else {
+                # All crisis dummies were included for other start dates
+                tests_for_this_path$Crisis_COVID    <- perform_safe_haven_test(fit_object, "Crisis", "COVID")
+                tests_for_this_path$Crisis_Subprime <- perform_safe_haven_test(fit_object, "Crisis", "Subprime")
+                tests_for_this_path$Crisis_Eurodebt <- perform_safe_haven_test(fit_object, "Crisis", "Eurodebt")
+            }
+        }
+    } else {
+        # Handle cases where fit failed or didn't converge
+        tests_for_this_path$Error <- result_item$error # Store original error
+        tests_for_this_path$Converged <- result_item$converged
+    }
+
+    # Store results along with path info
+    sh_test_results[[k]] <- list(path = current_path_info, tests = tests_for_this_path)
+ }
+# # Now sh_test_results contains the relevant test results (or error info) for each path.
+```
+
+#### Strong safe haven tests
+
+```{r}
+strong_sh_test_results <- list()
+for (k in 1:length(baur_results)) {
+    result_item <- baur_results[[k]]
+    current_path_info <- baur_paths[k, ] # Get path info for this result
+
+    tests_for_this_path <- list() # Store potentially multiple tests per path
+
+    # Check if fit exists and converged
+    if (!is.null(result_item$summary) &&
+        !inherits(result_item$summary, "error") &&
+        !is.null(result_item$converged) && result_item$converged == TRUE) {
+
+        fit_object <- result_item$summary
+        current_dummy_type <- current_path_info$Dummy_Type
+
+        if (current_dummy_type == "Quantile") {
+            # Perform tests for all defined quantile levels
+            tests_for_this_path$Quantile_10 <- perform_strong_safe_haven_test(fit_object, "Quantile", 10)
+            tests_for_this_path$Quantile_5  <- perform_strong_safe_haven_test(fit_object, "Quantile", 5)
+            tests_for_this_path$Quantile_2.5<- perform_strong_safe_haven_test(fit_object, "Quantile", 2.5)
+            tests_for_this_path$Quantile_1  <- perform_strong_safe_haven_test(fit_object, "Quantile", 1)
+        } else if (current_dummy_type == "Crisis") {
+# Check which crisis dummies were included based on Sample_Start
+            if (current_path_info$Sample_Start == as.Date("2014-01-01")) {
+                # Only COVID dummy was included for this path start date
+                tests_for_this_path$Crisis_COVID <- perform_strong_safe_haven_test(fit_object, "Crisis", "COVID")
+                # Add entries indicating other tests were not applicable
+                tests_for_this_path$Crisis_Subprime <- list(error_message = "Test not applicable for this path specification (Start Date 2014)")
+                tests_for_this_path$Crisis_Eurodebt <- list(error_message = "Test not applicable for this path specification (Start Date 2014)")
+            } else {
+                # All crisis dummies were included for other start dates
+                tests_for_this_path$Crisis_COVID    <- perform_strong_safe_haven_test(fit_object, "Crisis", "COVID")
+                tests_for_this_path$Crisis_Subprime <- perform_strong_safe_haven_test(fit_object, "Crisis", "Subprime")
+                tests_for_this_path$Crisis_Eurodebt <- perform_strong_safe_haven_test(fit_object, "Crisis", "Eurodebt")
+            }
+        }
+    } else {
+        # Handle cases where fit failed or didn't converge
+        tests_for_this_path$Error <- result_item$error # Store original error
+        tests_for_this_path$Converged <- result_item$converged
+    }
+
+    # Store results along with path info
+    strong_sh_test_results[[k]] <- list(path = current_path_info, tests = tests_for_this_path)
+ }
+# # Now sh_test_results contains the relevant test results (or error info) for each path.
+```
+
+### Assemble results in one tidy table
+
+#### General safe haven case
+
+```{r}
+baur_sh_output <- baur_paths[1,]
+baur_sh_output$Test <- NA
+baur_sh_output$t_val <- NA
+baur_sh_output$p_val <- NA
+
+for (i in 1:length(sh_test_results)){ 
+    path_info <- sh_test_results[[i]]$path # Path info (a list or 1-row data frame)
+      for (j in 1:length(sh_test_results[[i]]$tests)){ 
+          # Construct op_row as a data frame/tibble explicitly
+          test_name <- names(sh_test_results[[i]]$tests)[j]
+          t_stat <- sh_test_results[[i]]$tests[[j]]$t_stat
+          p_stat <- sh_test_results[[i]]$tests[[j]]$p_value
+          op_row <- tibble::tibble(
+          !!!path_info, # Splice the path info columns
+          Test = test_name,
+          t_val = t_stat,
+          p_val = p_stat)
+          baur_sh_output <- dplyr::bind_rows(baur_sh_output, op_row)
+      }
+    }
+  baur_sh_output <- baur_sh_output[-1,]
+```
+
+#### Strong safe haven case
+
+```{r}
+baur_strong_sh_output <- baur_paths[1,]
+baur_strong_sh_output$Test <- NA
+baur_strong_sh_output$t_val <- NA
+baur_strong_sh_output$p_val <- NA
+
+for (i in 1:length(sh_test_results)){ 
+    path_info <- strong_sh_test_results[[i]]$path # Path info (a list or 1-row data frame)
+      for (j in 1:length(strong_sh_test_results[[i]]$tests)){ 
+          # Construct op_row as a data frame/tibble explicitly
+          test_name <- names(strong_sh_test_results[[i]]$tests)[j]
+          t_stat <- strong_sh_test_results[[i]]$tests[[j]]$t_stat
+          p_stat <- strong_sh_test_results[[i]]$tests[[j]]$p_value
+          op_row <- tibble::tibble(
+          !!!path_info, # Splice the path info columns
+          Test = test_name,
+          t_val = t_stat,
+          p_val = p_stat)
+          baur_strong_sh_output <- dplyr::bind_rows(baur_strong_sh_output, op_row)
+      }
+    }
+  baur_strong_sh_output <- baur_strong_sh_output[-1,]
+```
+
+## DCC
+
+### Test functions
+
+#### General safe haven test function for quantile dummy cases
+
+```{r}
+perform_dcc_sum_test <- function(lm_object, quantile_level) {
+  
+coeffs <- tryCatch(coef(lm_object), error = function(e) NULL)
+
+# Use Newey-West standard errors for var-covar matrix
+vcov_matrix <- tryCatch({
+      sandwich::NeweyWest(lm_object)
+      }, error = function(e) {
+          warning(paste("NeweyWest VCOV calculation failed:", conditionMessage(e)))
+          NULL # Return NULL if NW calculation fails
+      })
+
+#Select the necessary coefficients to test
+if (quantile_level == 10) {
+      target_coeffs_names <- c("p10")
+  } else if (quantile_level == 5) {
+      target_coeffs_names <- c("p10", "p5")
+  } else if (quantile_level == 2.5) {
+      target_coeffs_names <- c("p10", "p5", "p2.5")
+  } else if (quantile_level == 1) {
+      target_coeffs_names <- c("p10", "p5", "p2.5", "p1")
+  } else {
+      warning(paste("Quantile level", quantile_level, "test not defined."))
+      na_return_list$error_message <- paste("Quantile level", quantile_level, "test not defined.")
+      return(na_return_list)
+  }
+
+coeff_names <- names(coeffs)
+target_coeffs_indices <- match(target_coeffs_names, coeff_names)
+
+#Linear combination vector
+L <- numeric(length(coeffs))
+L[target_coeffs_indices] <- 1
+
+#Compute test sum
+test_sum <- L %*% coeffs
+
+#Calculate coefficient variance
+var_sum <- tryCatch(t(L) %*% vcov_matrix %*% L, error = function(e) NA)
+
+#Calculate standard error
+std_err <- sqrt(var_sum)
+
+#Calculate test stat
+t_stat <- test_sum / std_err
+#Calculate p-value
+df_resid <- df.residual(lm_object)
+p_value <- pt(t_stat, df = df_resid,lower.tail = FALSE) #pt is a bit more prudent here than pnorm, but the differences are marginal
+
+return(list(
+      test_sum = as.numeric(test_sum),
+      std_err = as.numeric(std_err),
+      t_stat = as.numeric(t_stat),
+      p_value = as.numeric(p_value),
+      coefficients_summed = paste(target_coeffs_names, collapse=" + ")))
+}
+```
+
+#### Strong safe haven test function for quantile dummy cases
+
+```{r}
+perform_dcc_sum_test_strong <- function(lm_object, quantile_level) {
+  
+coeffs <- tryCatch(coef(lm_object), error = function(e) NULL)
+
+#Use Newey-West standard errors for var-covar matrix
+vcov_matrix <- tryCatch({
+      sandwich::NeweyWest(lm_object)
+      }, error = function(e) {
+          warning(paste("NeweyWest VCOV calculation failed:", conditionMessage(e)))
+          NULL # Return NULL if NW calculation fails
+      })
+
+if (quantile_level == 10) {
+      target_coeffs_names <- c("p10")
+  } else if (quantile_level == 5) {
+      target_coeffs_names <- c("p10", "p5")
+  } else if (quantile_level == 2.5) {
+      target_coeffs_names <- c("p10", "p5", "p2.5")
+  } else if (quantile_level == 1) {
+      target_coeffs_names <- c("p10", "p5", "p2.5", "p1")
+  } else {
+      warning(paste("Quantile level", quantile_level, "test not defined."))
+      na_return_list$error_message <- paste("Quantile level", quantile_level, "test not defined.")
+      return(na_return_list)
+  }
+
+coeff_names <- names(coeffs)
+target_coeffs_indices <- match(target_coeffs_names, coeff_names)
+
+
+L <- numeric(length(coeffs))
+L[target_coeffs_indices] <- 1
+
+test_sum <- L %*% coeffs
+
+var_sum <- tryCatch(t(L) %*% vcov_matrix %*% L, error = function(e) NA)
+
+std_err <- sqrt(var_sum)
+
+t_stat <- test_sum / std_err
+df_resid <- df.residual(lm_object)
+p_value <- pt(t_stat, df = df_resid,lower.tail = TRUE)
+
+return(list(
+      test_sum = as.numeric(test_sum),
+      std_err = as.numeric(std_err),
+      t_stat = as.numeric(t_stat),
+      p_value = as.numeric(p_value),
+      coefficients_summed = paste(target_coeffs_names, collapse=" + ")))
+}
+```
+
+### Test running
+
+#### General safe haven tests
+
+```{r}
+dcc_sh_output <- dcc_paths[1,]
+dcc_sh_output$Test <- NA
+dcc_sh_output$t_val <- NA
+dcc_sh_output$p_val <- NA
+
+for (i in 1:length(dcc_results)){ 
+    coeffs_matrix <- coeftest(dcc_results[[i]]$sh_lm,vcov. = NeweyWest(dcc_results[[i]]$sh_lm))
+    path_info <- dcc_results[[i]]$path # Path info (a list or 1-row data frame)
+      for (j in 2:nrow(coeffs_matrix)){ # Loop from 2nd coeff onwards
+          # Construct op_row as a data frame/tibble explicitly
+        test_name <- rownames(coeffs_matrix)[j]
+        #Forking paths by dummy type
+        #We start with crisis dummies
+        if (dcc_results[[i]]$path$Dummy_Type=="Crisis") {
+              t_stat <- coeffs_matrix[j, 3]
+              p_2sided <- coeffs_matrix[j, 4]
+              #Convert two-sided p-value to one-sided lower-tail
+              if (t_stat > 0) {
+                p_stat <- p_2sided / 2 # Use half of 2-sided p-value
+            } else { 
+                p_stat <- 1 - (p_2sided / 2) # Use 1 - half of 2-sided p-value
+            }
+        } else {
+          #For quantile cases we use the previous function
+              lm_object <- dcc_results[[i]]$sh_lm
+              q <- as.numeric(substr(test_name,2,nchar(test_name)))
+              sh_test <- perform_dcc_sum_test(lm_object,q)
+              t_stat <- sh_test$t_stat
+              p_stat <- sh_test$p_value
+        }
+              op_row <- tibble::tibble(
+              !!!path_info, # Splice the path info columns
+              Test = test_name,
+              t_val = t_stat,
+              p_val = p_stat)
+          dcc_sh_output <- dplyr::bind_rows(dcc_sh_output, op_row)
+      }
+    }
+  dcc_sh_output <- dcc_sh_output[-1,]
+```
+
+#### Strong safe haven tests
+
+```{r}
+dcc_strong_sh_output <- dcc_paths[1,]
+dcc_strong_sh_output$Test <- NA
+dcc_strong_sh_output$t_val <- NA
+dcc_strong_sh_output$p_val <- NA
+
+for (i in 1:length(dcc_results)){ 
+    coeffs_matrix <- coeftest(dcc_results[[i]]$sh_lm,vcov. = NeweyWest(dcc_results[[i]]$sh_lm))
+    path_info <- dcc_results[[i]]$path # Path info 
+      for (j in 2:nrow(coeffs_matrix)){ # Loop from 2nd coeff onwards
+          # Construct op_row as a data frame/tibble explicitly
+        test_name <- rownames(coeffs_matrix)[j]
+        #Forking paths by dummy type
+        #We start with crisis dummies
+        if (dcc_results[[i]]$path$Dummy_Type=="Crisis") {
+              t_stat <- coeffs_matrix[j, 3]
+              p_2sided <- coeffs_matrix[j, 4]
+              #Convert two-sided p-value to one-sided upper-tail
+              if (t_stat > 0) {
+                p_stat <- 1-(p_2sided / 2) 
+            } else { 
+                p_stat <-  (p_2sided / 2) 
+            }
+        } else {
+              lm_object <- dcc_results[[i]]$sh_lm
+              q <- as.numeric(substr(test_name,2,nchar(test_name)))
+              sh_test <- perform_dcc_sum_test_strong(lm_object,q)
+              t_stat <- sh_test$t_stat
+              p_stat <- sh_test$p_value
+        }
+              op_row <- tibble::tibble(
+              !!!path_info, # Splice the path info columns
+              Test = test_name,
+              t_val = t_stat,
+              p_val = p_stat)
+          dcc_strong_sh_output <- dplyr::bind_rows(dcc_strong_sh_output, op_row)
+      }
+    }
+  dcc_strong_sh_output <- dcc_strong_sh_output[-1,]
+```
+
+## Combine results
+
+Here we combine all the tests into one tidy table.
+
+### General safe haven tests
+
+```{r}
+#Number of tests per methodology family
+baur_n <- nrow(baur_sh_output)
+dcc_n <- nrow(dcc_sh_output)
+
+#Add methodlogy family labels
+Method <- rep("Baur", baur_n)
+baur_final <- cbind(Method, baur_sh_output)
+
+Method <- rep("DCC", dcc_n)
+dcc_final <- cbind(Method, dcc_sh_output)
+
+#Unify test names across methodologies
+baur_final$Test[baur_final$Test=="Crisis_COVID"] <- "COVID"
+baur_final$Test[baur_final$Test=="Crisis_Subprime"] <- "Subprime"
+baur_final$Test[baur_final$Test=="Crisis_Eurodebt"] <- "Eurodebt"
+
+dcc_final$Test[dcc_final$Test=="p1"] <- "Quantile_1"
+dcc_final$Test[dcc_final$Test=="p2.5"] <- "Quantile_2.5"
+dcc_final$Test[dcc_final$Test=="p5"] <- "Quantile_5"
+dcc_final$Test[dcc_final$Test=="p10"] <- "Quantile_10"
+
+#Combine tables
+results <- bind_rows(baur_final,dcc_final)
+results <- results[,c(1:8,12:13,9:11)]
+#Remove non-tested paths (start date=2014-01-01 + Subprime, Eurodebt test combos)
+results_clean <- results[!is.na(results$t_val),]
+```
+
+### Strong safe haven tests
+
+```{r}
+#Number of tests per methodology family
+baur_n_strong <- nrow(baur_strong_sh_output)
+dcc_n_strong <- nrow(dcc_strong_sh_output)
+
+#Add methodlogy family labels
+Method <- rep("Baur", baur_n_strong)
+baur_strong_final <- cbind(Method, baur_strong_sh_output)
+
+Method <- rep("DCC", dcc_n_strong)
+dcc_strong_final <- cbind(Method, dcc_strong_sh_output)
+
+#Unify test names across methodologies
+baur_strong_final$Test[baur_strong_final$Test=="Crisis_COVID"] <- "COVID"
+baur_strong_final$Test[baur_strong_final$Test=="Crisis_Subprime"] <- "Subprime"
+baur_strong_final$Test[baur_strong_final$Test=="Crisis_Eurodebt"] <- "Eurodebt"
+
+dcc_strong_final$Test[dcc_strong_final$Test=="p1"] <- "Quantile_1"
+dcc_strong_final$Test[dcc_strong_final$Test=="p2.5"] <- "Quantile_2.5"
+dcc_strong_final$Test[dcc_strong_final$Test=="p5"] <- "Quantile_5"
+dcc_strong_final$Test[dcc_strong_final$Test=="p10"] <- "Quantile_10"
+
+#Combine tables
+results_strong <- bind_rows(baur_strong_final,dcc_strong_final)
+results_strong <- results_strong[,c(1:8,12:13,9:11)]
+#Remove non-tested paths (start date=2014-01-01 + Subprime, Eurodebt test combos)
+results_strong_clean <- results_strong[!is.na(results_strong$t_val),]
+```
+
+## Multiple hypothesis testing
+
+### General safe haven tests
+
+```{r}
+# c("holm", "hochberg", "hommel", "bonferroni", "BH", "BY", "fdr", "none")
+sig_lev <- 0.05
+
+#H0: total effect during crisis<=0 ->allows weak safe haven property as well
+#H1: total effect during crisis>0  
+
+#Assign dummy values if we can't reject the safe haven property using raw p-values
+results_clean$raw_sig <- 0
+results_clean$raw_sig[results_clean$p_val>sig_lev] <- 1
+
+#Do the same with Holm, Bonferroni and BH p-value adjustments
+results_clean$p_val_holm <- p.adjust(results_clean$p_val, method="holm")
+results_clean$holm_sig <- 0
+results_clean$holm_sig[results_clean$p_val_holm>sig_lev] <- 1
+
+results_clean$p_val_bon <- p.adjust(results_clean$p_val, method="bonferroni")
+results_clean$bon_sig <- 0
+results_clean$bon_sig[results_clean$p_val_bon>sig_lev] <- 1
+
+results_clean$p_val_bh <- p.adjust(results_clean$p_val, method="BH")
+results_clean$bh_sig <- 0
+results_clean$bh_sig[results_clean$p_val_bh>sig_lev] <- 1
+```
+
+### Strong safe haven tests
+
+```{r}
+# c("holm", "hochberg", "hommel", "bonferroni", "BH", "BY", "fdr", "none")
+sig_lev <- 0.05
+
+#H0: total effect during crisis>=0 
+#H1: total effect during crisis<0  ->only strong property
+
+#Assign dummy values if we can accept the strong safe haven property using raw p-values
+results_strong_clean$raw_sig <- 0
+results_strong_clean$raw_sig[results_strong_clean$p_val<sig_lev] <- 1
+
+#Do the same with Holm, Bonferroni and BH p-value adjustments
+results_strong_clean$p_val_holm <- p.adjust(results_strong_clean$p_val, method="holm")
+results_strong_clean$holm_sig <- 0
+results_strong_clean$holm_sig[results_strong_clean$p_val_holm<sig_lev] <- 1
+
+results_strong_clean$p_val_bon <- p.adjust(results_strong_clean$p_val, method="bonferroni")
+results_strong_clean$bon_sig <- 0
+results_strong_clean$bon_sig[results_strong_clean$p_val_bon<sig_lev] <- 1
+
+results_strong_clean$p_val_bh <- p.adjust(results_strong_clean$p_val, method="BH")
+results_strong_clean$bh_sig <- 0
+results_strong_clean$bh_sig[results_strong_clean$p_val_bh<sig_lev] <- 1
+```
+
+### Table exporting
+
+Here we export the final results to be more easily and visually examined in MS Excel for example
+
+```{r}
+write.csv(results_clean,"results_clean.csv")
+write.csv(results_strong_clean,"results_strong_clean.csv")
+```
+
+## Plots
+
+### Setup
+
+Create a copy of the results (doesn't matter which) to analyze the distribution of the statistics:
+
+```{r}
+results_plot <- results_clean
+results_plot$Sample_Start <- as.factor(results_plot$Sample_Start)
+results_plot$Sample_End <- as.factor(results_plot$Sample_End)
+```
+
+### Distribution of t-statistic across all paths
+
+```{r}
+ggplot(results_clean, aes(x = t_val)) +
+  geom_density(alpha = 0.7) + # Use geom_density for distribution outline
+  labs(
+    x = "t-statistic Value",
+    y = "Density"
+  ) +
+  theme_minimal() + # Use a clean theme
+  theme(legend.position = "bottom") # Position legend
+ggsave("tdist.png",bg="white", width = 150, height = 75,units="mm")
+```
+
+### Distribution by GARCH model
+
+```{r}
+ggplot(results_clean, aes(x = t_val, fill = GARCH_Model)) +
+  geom_density(alpha = 0.7) + # Use geom_density for distribution outline
+  labs(
+    x = "t-statistic Value",
+    y = "Density",
+    fill = "GARCH Model" # Legend title
+  ) +
+  theme_minimal(base_size =12) + # Use a clean theme
+  theme(legend.position = "bottom") # Position legend
+ggsave("GARCH.png",bg="white")
+```
+
+### Distribution by methodology family
+
+```{r}
+ggplot(results_clean, aes(x = t_val, fill = Method)) +
+  geom_density(alpha = 0.7) + # Use geom_density for distribution outline
+  labs(
+    x = "t-statistic Value",
+    y = "Density"
+  ) +
+  theme_minimal(base_size =12) + # Use a clean theme
+  theme(legend.position = "bottom") # Position legend
+ggsave("method.png",bg="white", width = 150, height = 75,units="mm")
+```
+
+### Distribution by benchmark asset
+
+```{r}
+ggplot(results_clean, aes(x = t_val, fill = Benchmark)) +
+  geom_density(alpha = 0.7) + # Use geom_density for distribution outline
+  labs(
+    x = "t-statistic Value",
+    y = "Density",
+    fill = "Benchmark asset" # Legend title
+  ) +
+  theme_minimal(base_size =12) + # Use a clean theme
+  theme(legend.position = "bottom") # Position legend
+ggsave("benchmark.png",bg="white", width = 150, height = 75,units="mm")
+```
+
+### Distribution by sample start
+
+```{r}
+ggplot(results_plot, aes(x = t_val, fill = Sample_Start)) +
+  geom_density(alpha = 0.7) + 
+  labs(
+    x = "t-statistic Value",
+    y = "Density",
+    fill = "Sample Start" # Legend title
+  ) +
+  theme_minimal(base_size =12) + # Use a clean theme
+  theme(legend.position = "bottom") # Position legend
+ggsave("start.png",bg="white", width = 150, height = 75,units="mm")
+```
+
+### Distribution by sample end
+
+```{r}
+
+ggplot(results_plot, aes(x = t_val, fill = Sample_End)) +
+  geom_density(alpha = 0.7) + # Use geom_density for distribution outline
+  labs(
+    x = "t-statistic Value",
+    y = "Density",
+    fill = "Sample End" # Legend title
+  ) +
+  theme_minimal(base_size =12) + # Use a clean theme
+  theme(legend.position = "bottom") # Position legend
+ggsave("end.png",bg="white", width = 150, height = 75,units="mm")
+```
+
+### Distribution by gold price type
+
+```{r}
+ggplot(results_plot, aes(x = t_val, fill = Spot_Futures)) +
+  geom_density(alpha = 0.7) + # Use geom_density for distribution outline
+  labs(
+    x = "t-statistic Value",
+    y = "Density",
+    fill = "Gold Price Type" # Legend title
+  ) +
+  theme_minimal(base_size =12) + # Use a clean theme
+  theme(legend.position = "bottom") # Position legend
+ggsave("price.png",bg="white", width = 150, height = 75,units="mm")
+```
+
+### Distribution by error type
+
+```{r}
+ggplot(results_plot, aes(x = t_val, fill = GARCH_Error)) +
+  geom_density(alpha = 0.7) + # Use geom_density for distribution outline
+  labs(
+    x = "t-statistic Value",
+    y = "Density",
+    fill = "Error Distribution" # Legend title
+  ) +
+  theme_minimal(base_size =12) + # Use a clean theme
+  theme(legend.position = "bottom") # Position legend
+ggsave("error.png",bg="white", width = 150, height = 75,units="mm")
+```
+
+### Distribution by dummy type
+
+```{r}
+ggplot(results_plot, aes(x = t_val, fill = Dummy_Type)) +
+  geom_density(alpha = 0.7) + # Use geom_density for distribution outline
+  labs(
+    x = "t-statistic Value",
+    y = "Density",
+    fill = "Dummy Type"
+  ) +
+  theme_minimal(base_size =12) + # Use a clean theme
+  theme(legend.position = "bottom") # Position legend
+ggsave("dummy.png",bg="white",width = 150, height = 75,units="mm")
+```
+
+### Distribution by market turmoil (all-in-one)
+
+```{r}
+level_order <- c("Quantile_10", "Quantile_5", "Quantile_2.5", "Quantile_1", 
+                 "Subprime", "Eurodebt", "COVID")
+
+
+results_plot_ordered <- results_plot %>%
+  mutate(Test = factor(Test, levels = level_order))
+
+
+ggplot(results_plot_ordered, aes(x = t_val, fill = Test)) +
+  geom_density(alpha = 0.7) + 
+  labs(
+    x = "t-statistic Value",
+    y = "Density",
+    fill = "Test Type"  # This correctly sets the legend title
+  ) +
+  theme_minimal(base_size = 12) + 
+  theme(legend.position = "bottom") 
+
+
+ggsave("test.png", bg="white", width = 150, height = 100, units="mm")
+```
+
+### Distribution by market turmoil (faceted)
+
+```{r}
+ggplot(results_plot_ordered, aes(x = t_val)) +
+  geom_density(alpha = 0.7) + # Use geom_density for distribution outline
+  facet_wrap(~ Test, scales = "fixed", ncol=2,nrow=4)+
+  labs(
+    x = "t-statistic Value",
+    y = "Density",
+    color = "GARCH Model" # Legend title
+  ) +
+  theme_minimal(base_size =12) + # Use a clean theme
+  theme(legend.position = "bottom") # Position legend
+ggsave("crisis.png",bg="white", width = 150, height = 100, units="mm")
+```
+
+### Distribution by DCC type
+
+```{r}
+ggplot(subset(results_plot, !is.na(DCC_type)), aes(x = t_val, fill = DCC_type)) +
+  geom_density(alpha = 0.7) + # Use geom_density for distribution outline
+  labs(
+    x = "t-statistic Value",
+    y = "Density",
+    color = "DCC Model" # Legend title
+  ) +
+  theme_minimal(base_size =12) + # Use a clean theme
+  theme(legend.position = "bottom") # Position legend
+ggsave("dcc.png",bg="white", width = 150, height = 75,units="mm")
+```
+
+### Returns
+
+```{r}
+# 1. Convert xts object to a long tibble (data frame)
+# (Includes renaming and factor reordering from previous step)
+  returns_long_df <- return_all %>%
+    tk_tbl(rename_index = "Date") %>%
+    pivot_longer(
+      cols = -Date,
+      names_to = "Asset",
+      values_to = "Return"
+    ) %>%
+    filter(!is.na(Return)) %>%
+    mutate(Asset = case_when(
+      Asset == "Spot"    ~ "Gold Spot",
+      Asset == "Futures" ~ "Gold Futures",
+      TRUE               ~ Asset
+    )) %>%
+    mutate(Asset = factor(Asset, levels = c(
+      "Gold Spot",
+      "Gold Futures",
+      sort(setdiff(unique(Asset), c("Gold Spot", "Gold Futures")))
+    )))
+
+# 2. Create the ggplot time series plot with ColorBrewer "Set2" colors
+  gg_time_series_plot_set2 <- ggplot(returns_long_df, aes(x = Date, y = Return, color = Asset)) +
+    geom_line(linewidth = 0.5) +
+    facet_wrap(~ Asset, ncol = 1, scales = "free_y") +
+
+    #Use ColorBrewer Set2 Palette
+    scale_color_brewer(palette = "Set2") +
+
+    labs(,
+      x = "Date",
+      y = "Log Return"
+    ) +
+    theme_minimal(base_size = 10) +
+    theme(
+      legend.position = "none",
+      strip.text = element_text(face = "bold")
+      )
+
+  # Print the plot
+  print(gg_time_series_plot_set2)
+  
+ggsave("returns.png",bg="white",width = 150, height = 150,units="mm")
+```
